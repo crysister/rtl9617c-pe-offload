@@ -175,6 +175,7 @@ struct rtl_pe_ctrl {
 	struct mutex lock;
 	struct kobject *root_kobj;
 	struct delayed_work wdt_work;
+	struct work_struct dma_reset_work;
 	struct notifier_block reboot_nb;
 	struct rtl_pe_core cores[RTL_PE_NUM_CORES];
 };
@@ -549,7 +550,8 @@ static int rtl_pe_ni_tx_hook(struct net_device *owner, struct sk_buff *skb,
 	if (unlikely(!skb || skb_is_gso(skb) || skb_has_frag_list(skb) ||
 		     skb->ip_summed == CHECKSUM_PARTIAL ||
 		     prefix_len > 64U || ldpid == TAURUS_NI_HDR_OAM_LDPID ||
-		     skb->protocol == htons(ETH_P_SLOW) || skb->len < ETH_HLEN))
+		     skb->protocol == htons(ETH_P_SLOW) ||
+		     skb->len < ETH_HLEN || skb_headlen(skb) < ETH_HLEN))
 		return -ENOENT;
 
 	pad_len = max_t(unsigned int, skb->len, 60U);
@@ -604,7 +606,16 @@ static int rtl_pe_ni_tx_hook(struct net_device *owner, struct sk_buff *skb,
 	put_unaligned_le64(header_a, buf + 8);
 	if (prefix_len)
 		memcpy(buf + RTL_PE_DMA_HDR_LEN, prefix, prefix_len);
-	skb_copy_bits(skb, 0, buf + RTL_PE_DMA_HDR_LEN + prefix_len, skb->len);
+	if (unlikely(skb_copy_bits(skb, 0,
+				   buf + RTL_PE_DMA_HDR_LEN + prefix_len,
+				   skb->len))) {
+		pe->slot_skb[slot_id] = NULL;
+		pe->free_stack[pe->free_cnt++] = slot_id;
+		pe->dp_tx_bypass++;
+		spin_unlock_irqrestore(&pe->dp_lock, flags);
+		rtl_pe_drain_skb_list(&free_q, false);
+		return -ENOENT;
+	}
 	if (unlikely(pad_len > skb->len))
 		memset(buf + RTL_PE_DMA_HDR_LEN + prefix_len + skb->len, 0,
 		       pad_len - skb->len);
@@ -678,13 +689,11 @@ static int rtl_pe_push_dp_reset_locked(struct rtl_pe_core *pe)
 	return 0;
 }
 
-static void rtl_pe_on_dma_reset(void)
+static void rtl_pe_dma_reset_work_fn(struct work_struct *work)
 {
-	struct rtl_pe_ctrl *ctrl = g_pe_ctrl;
+	struct rtl_pe_ctrl *ctrl = container_of(work, struct rtl_pe_ctrl,
+						dma_reset_work);
 	unsigned int i;
-
-	if (!ctrl)
-		return;
 
 	mutex_lock(&ctrl->lock);
 	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
@@ -694,6 +703,14 @@ static void rtl_pe_on_dma_reset(void)
 			rtl_pe_push_dp_reset_locked(pe);
 	}
 	mutex_unlock(&ctrl->lock);
+}
+
+static void rtl_pe_on_dma_reset(void)
+{
+	struct rtl_pe_ctrl *ctrl = READ_ONCE(g_pe_ctrl);
+
+	if (ctrl)
+		schedule_work(&ctrl->dma_reset_work);
 }
 
 static inline int rtl_pe_attach_ni_hook(struct device *dev)
@@ -1575,6 +1592,7 @@ static void rtl_pe_quiesce_all(struct rtl_pe_ctrl *ctrl)
 	unsigned int i;
 
 	rtl_pe_detach_ni_hook();
+	cancel_work_sync(&ctrl->dma_reset_work);
 	cancel_delayed_work_sync(&ctrl->wdt_work);
 	mutex_lock(&ctrl->lock);
 	for (i = 0; i < RTL_PE_NUM_CORES; i++)
@@ -1624,13 +1642,7 @@ static int rtl_pe_probe(struct platform_device *pdev)
 	if (IS_ERR(ctrl->peaxi_clk))
 		ctrl->peaxi_clk = NULL;
 
-	ctrl->root_kobj = kobject_create_and_add("rtl9617c_pe", kernel_kobj);
-	if (!ctrl->root_kobj)
-		return -ENOMEM;
-
-	ret = sysfs_create_group(ctrl->root_kobj, &pe_root_group);
-	if (ret)
-		goto err_root;
+	INIT_WORK(&ctrl->dma_reset_work, rtl_pe_dma_reset_work_fn);
 
 	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
 		struct rtl_pe_core *pe = &ctrl->cores[i];
@@ -1653,13 +1665,35 @@ static int rtl_pe_probe(struct platform_device *pdev)
 		pe->atu = devm_ioremap(&pdev->dev,
 				       TAURUS_ATU0_BASE + i * TAURUS_ATU_STRIDE,
 				       TAURUS_ATU_SIZE);
-		if (!pe->atu) {
-			ret = -ENOMEM;
-			goto err_cores;
-		}
+		if (!pe->atu)
+			return -ENOMEM;
 		pe->sram = sram_base + TAURUS_SRAM_CORE_OFF(i);
 		pe->clk_gated = !!(readl(ctrl->glb + TAURUS_GLB_CFG_OFF) &
 				   TAURUS_CFG_PD_OFFLOAD(i));
+	}
+
+	WRITE_ONCE(g_pe_ctrl, ctrl);
+	platform_set_drvdata(pdev, ctrl);
+
+	ctrl->reboot_nb.notifier_call = rtl_pe_reboot_notify;
+	register_reboot_notifier(&ctrl->reboot_nb);
+
+	ret = rtl_pe_attach_ni_hook(&pdev->dev);
+	if (ret)
+		goto err_hook;
+
+	ctrl->root_kobj = kobject_create_and_add("rtl9617c_pe", kernel_kobj);
+	if (!ctrl->root_kobj) {
+		ret = -ENOMEM;
+		goto err_root_create;
+	}
+
+	ret = sysfs_create_group(ctrl->root_kobj, &pe_root_group);
+	if (ret)
+		goto err_root;
+
+	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
+		struct rtl_pe_core *pe = &ctrl->cores[i];
 
 		ret = kobject_init_and_add(&pe->kobj, &pe_core_ktype,
 					   ctrl->root_kobj, "pe%u", i);
@@ -1669,31 +1703,24 @@ static int rtl_pe_probe(struct platform_device *pdev)
 		}
 	}
 
-	ctrl->reboot_nb.notifier_call = rtl_pe_reboot_notify;
-	register_reboot_notifier(&ctrl->reboot_nb);
-
-	g_pe_ctrl = ctrl;
-	platform_set_drvdata(pdev, ctrl);
-
-	ret = rtl_pe_attach_ni_hook(&pdev->dev);
-	if (ret)
-		goto err_hook;
-
 	rtl_pe_read_clks(ctrl, &pe_hz, &peaxi_hz);
 	dev_info(&pdev->dev, "RTL9617C dual Taroko MIPS32 PE data-plane driver ready (PE %u MHz, AXI %u MHz)\n",
 		 pe_hz / 1000000U, peaxi_hz / 1000000U);
 	return 0;
 
-err_hook:
-	g_pe_ctrl = NULL;
-	unregister_reboot_notifier(&ctrl->reboot_nb);
-	i = RTL_PE_NUM_CORES;
 err_cores:
-	while (i--)
+	while (i--) {
+		kobject_del(&ctrl->cores[i].kobj);
 		kobject_put(&ctrl->cores[i].kobj);
+	}
 	sysfs_remove_group(ctrl->root_kobj, &pe_root_group);
 err_root:
 	kobject_put(ctrl->root_kobj);
+err_root_create:
+	rtl_pe_quiesce_all(ctrl);
+err_hook:
+	unregister_reboot_notifier(&ctrl->reboot_nb);
+	WRITE_ONCE(g_pe_ctrl, NULL);
 	return ret;
 }
 
@@ -1702,13 +1729,18 @@ static void rtl_pe_remove(struct platform_device *pdev)
 	struct rtl_pe_ctrl *ctrl = platform_get_drvdata(pdev);
 	unsigned int i;
 
-	rtl_pe_detach_ni_hook();
+	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
+		kobject_del(&ctrl->cores[i].kobj);
+		kobject_put(&ctrl->cores[i].kobj);
+	}
+	sysfs_remove_group(ctrl->root_kobj, &pe_root_group);
+	kobject_put(ctrl->root_kobj);
+
 	unregister_reboot_notifier(&ctrl->reboot_nb);
 	rtl_pe_quiesce_all(ctrl);
-	g_pe_ctrl = NULL;
+	WRITE_ONCE(g_pe_ctrl, NULL);
 
 	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
-		kobject_put(&ctrl->cores[i].kobj);
 		if (ctrl->cores[i].pool) {
 			dma_free_coherent(ctrl->dev, RTL_PE_POOL_BYTES,
 					  ctrl->cores[i].pool, ctrl->cores[i].pool_dma);
@@ -1720,8 +1752,6 @@ static void rtl_pe_remove(struct platform_device *pdev)
 			ctrl->cores[i].mem = NULL;
 		}
 	}
-	sysfs_remove_group(ctrl->root_kobj, &pe_root_group);
-	kobject_put(ctrl->root_kobj);
 }
 
 static void rtl_pe_shutdown(struct platform_device *pdev)
